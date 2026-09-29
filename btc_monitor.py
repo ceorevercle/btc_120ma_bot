@@ -1,154 +1,102 @@
-import os
+import os, json, math, sys
+from datetime import datetime, timezone, timedelta
 import requests
-import json
-from datetime import datetime, timezone
-from pathlib import Path
 
-SYMBOL = "BTCUSDT"
-MA_PERIOD = 120
-PROXIMITY_PCT = 5.0
-STATE_FILE = Path("state.json")
+STATE_FILE = "state.json"
+BINANCE_SYMBOL = "BTCUSDT"
+BINANCE_INTERVAL = "1d"
 
-BINANCE_KLINE_URL = "https://api.binance.com/api/v3/klines"
-BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-def send_telegram(msg: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[DRY-RUN] 텔레그램 토큰/ID 없음")
-        print(msg)
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        print(f"텔레그램 전송: {r.status_code} - {r.text[:200]}")
-    except Exception as e:
-        print(f"텔레그램 실패: {e}")
-
-def get_klines(limit=121):
-    params = {"symbol": SYMBOL, "interval": "1d", "limit": limit}
-    r = requests.get(BINANCE_KLINE_URL, params=params, timeout=10)
+def get_klines(limit=200):
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": BINANCE_SYMBOL, "interval": BINANCE_INTERVAL, "limit": limit}
+    r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
     return r.json()
 
-def get_current_price():
-    r = requests.get(BINANCE_TICKER_URL, params={"symbol": SYMBOL}, timeout=10)
-    r.raise_for_status()
-    return float(r.json()["price"])
+def calc_ma(closes, period=120):
+    if len(closes) < period:
+        return None
+    return sum(closes[-period:]) / period
+
+def send_telegram(token, chat_id, text):
+    if not token or not chat_id:
+        print("텔레그램 토큰/챗ID 없음")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        print(f"텔레그램 전송: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        print(f"텔레그램 전송 실패: {e}")
 
 def load_state():
-    if STATE_FILE.exists():
+    if os.path.exists(STATE_FILE):
         try:
-            return json.loads(STATE_FILE.read_text())
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
         except:
             return {}
     return {}
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
     print(f"state 저장: {state}")
 
 def main():
     print("=== BTC 120MA 모니터 시작 ===")
-    try:
-        klines = get_klines(limit=MA_PERIOD+1)
-    except Exception as e:
-        print(f"바이낸스 조회 실패: {e}")
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    force_notify = os.getenv("FORCE_NOTIFY", "").lower() in ("1", "true", "yes")
+    print(f"FORCE_NOTIFY={force_notify}")
+
+    klines = get_klines(limit=200)
+    closes = [float(k[4]) for k in klines]
+    times = [int(k[0]) for k in klines]
+
+    yesterday_close = closes[-2]
+    yesterday_time = datetime.fromtimestamp(times[-2]/1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    ma120_yesterday = calc_ma(closes[:-1], 120)
+    current_price = closes[-1]
+
+    if ma120_yesterday is None:
+        print("120MA 계산 불가")
         return
 
-    closes = [float(k[4]) for k in klines]
-    yesterday_close = closes[-2]
-    ma_yesterday = sum(closes[-MA_PERIOD-1:-1]) / MA_PERIOD
-    yesterday_open_time = int(klines[-2][0]) / 1000
-    yesterday_date = datetime.fromtimestamp(yesterday_open_time, tz=timezone.utc).strftime("%Y-%m-%d")
-
-    try:
-        current_price = get_current_price()
-    except:
-        current_price = closes[-1]
-        print("현재가 조회 실패, 오늘 봉으로 대체")
-
-    distance_pct = (current_price - ma_yesterday) / ma_yesterday * 100
-
-    print(f"어제({yesterday_date}) 종가: {yesterday_close:,.2f}")
-    print(f"120MA(어제 기준): {ma_yesterday:,.2f}")
-    print(f"현재가: {current_price:,.2f} / 거리: {distance_pct:+.2f}%")
+    distance = (current_price - ma120_yesterday) / ma120_yesterday * 100
+    print(f"어제({yesterday_time}) 종가: {yesterday_close:,.2f}")
+    print(f"120MA(어제 기준): {ma120_yesterday:,.2f}")
+    print(f"현재가: {current_price:,.2f} / 거리: {distance:+.2f}%")
 
     state = load_state()
-    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    last_distance = state.get("last_distance")
 
-    if yesterday_close < ma_yesterday:
-        last_breakdown = state.get("last_breakdown_alert_date")
-        if last_breakdown != yesterday_date:
-            msg = (
-                f"💥 *BTC 일봉 120일선 이탈 확정*\n"
-                f"어제({yesterday_date}) 종가가 120MA 아래서 마감\n"
-                f"- 어제 종가: ${yesterday_close:,.2f}\n"
-                f"- 120MA: ${ma_yesterday:,.2f}\n"
-                f"- 괴리: {(yesterday_close-ma_yesterday)/ma_yesterday*100:+.2f}%\n"
-                f"- 현재가: ${current_price:,.2f}\n\n"
-                f"👉 수동 매도 검토 필요"
-            )
-            send_telegram(msg)
-            state["last_breakdown_alert_date"] = yesterday_date
-            state["last_proximity_alert_date"] = ""
-            state["last_below_alert_date"] = ""
-            save_state(state)
+    # 1) 이탈 확정: 어제 종가 < 120MA
+    if yesterday_close < ma120_yesterday:
+        msg = f"💥 BTC 120MA 이탈 확정\n어제({yesterday_time}) 종가 ${yesterday_close:,.2f} < 120MA ${ma120_yesterday:,.2f} ({((yesterday_close-ma120_yesterday)/ma120_yesterday*100):+.2f}%)\n현재가 ${current_price:,.2f}"
+        send_telegram(token, chat_id, msg)
+    # 2) 하회 중
+    elif current_price < ma120_yesterday:
+        msg = f"🚨 BTC 120MA 하회 중\n현재가 ${current_price:,.2f} < 120MA ${ma120_yesterday:,.2f} ({distance:+.2f}%)"
+        send_telegram(token, chat_id, msg)
+    # 3) 근접 중 (5% 이내)
+    elif distance <= 5.0:
+        if last_distance is None or last_distance > 5.0:
+            msg = f"⚠️ BTC 120MA 근접\n현재가 ${current_price:,.2f}, 120MA ${ma120_yesterday:,.2f} ({distance:+.2f}%) - 5% 이내 진입"
+            send_telegram(token, chat_id, msg)
         else:
-            print("이미 오늘 이탈 알림 보냄 - 스킵")
-        return
-
-    if distance_pct <= 0:
-        last_below = state.get("last_below_alert_date")
-        if last_below != today_utc:
-            msg = (
-                f"🚨 *BTC 120일선 하회 중 - 일봉 마감 대기*\n"
-                f"- 현재가: ${current_price:,.2f}\n"
-                f"- 120MA: ${ma_yesterday:,.2f}\n"
-                f"- 괴리: {distance_pct:+.2f}% (하회)\n"
-                f"- 어제 종가: ${yesterday_close:,.2f}\n\n"
-                f"아직 마감 전이라 실행 안 함. 13시 마감 체크."
-            )
-            send_telegram(msg)
-            state["last_below_alert_date"] = today_utc
-            save_state(state)
-        else:
-            print("오늘 이미 하회중 알림 보냄 - 스킵")
-        return
-
-    if 0 < distance_pct <= PROXIMITY_PCT:
-        last_prox = state.get("last_proximity_alert_date")
-        prev_distance = state.get("last_distance")
-        should_send = False
-        if last_prox != today_utc:
-            should_send = True
-        if prev_distance is not None and prev_distance > PROXIMITY_PCT:
-            should_send = True
-        if not state:
-            should_send = True
-
-        if should_send:
-            msg = (
-                f"⚠️ *BTC 120일선 근접 중*\n"
-                f"- 현재가: ${current_price:,.2f}\n"
-                f"- 120MA: ${ma_yesterday:,.2f}\n"
-                f"- 괴리: +{distance_pct:.2f}% (5% 이내)\n"
-                f"- 어제 종가: ${yesterday_close:,.2f}\n\n"
-                f"120일선까지 {distance_pct:.2f}% 남음."
-            )
-            send_telegram(msg)
-            state["last_proximity_alert_date"] = today_utc
-        else:
-            print("근접 알림 오늘 이미 보냄 - 스킵")
+            print("이미 근접 알림 보낸 상태 - 중복 방지")
     else:
-        print(f"안정 구간 (괴리 +{distance_pct:.2f}% > 5%) - 알림 없음")
+        # 안정 구간
+        if force_notify:
+            msg = f"✅ BTC 일일 리포트 ({yesterday_time})\n어제 종가: ${yesterday_close:,.2f}\n120MA: ${ma120_yesterday:,.2f}\n현재가: ${current_price:,.2f}\n괴리: {distance:+.2f}%\n상태: 안정 구간 - 문제 없음"
+            print("일일 리포트 발송 시도")
+            send_telegram(token, chat_id, msg)
+        else:
+            print(f"안정 구간 (괴리 {distance:+.2f}% > 5%) - 알림 없음")
 
-    state["last_distance"] = distance_pct
-    state["last_check_utc"] = today_utc
-    save_state(state)
+    save_state({"last_distance": distance, "last_check_utc": datetime.now(timezone.utc).isoformat()})
     print("=== 종료 ===")
 
 if __name__ == "__main__":
