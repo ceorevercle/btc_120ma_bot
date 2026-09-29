@@ -6,12 +6,56 @@ STATE_FILE = "state.json"
 BINANCE_SYMBOL = "BTCUSDT"
 BINANCE_INTERVAL = "1d"
 
+# 바이낸스 451 우회용 엔드포인트 리스트 (Vision이 메인)
+BINANCE_ENDPOINTS = [
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+]
+
 def get_klines(limit=200):
-    url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": BINANCE_SYMBOL, "interval": BINANCE_INTERVAL, "limit": limit}
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    headers = {"User-Agent": "Mozilla/5.0"}
+    last_err = None
+    for base_url in BINANCE_ENDPOINTS:
+        url = f"{base_url}/api/v3/klines"
+        try:
+            print(f"시도: {url}")
+            r = requests.get(url, params=params, headers=headers, timeout=15)
+            r.raise_for_status()
+            print(f"성공: {base_url}")
+            return r.json()
+        except Exception as e:
+            print(f"실패 {base_url}: {e}")
+            last_err = e
+            continue
+    # 모든 바이낸스 실패시 코인게코로 폴백 (일봉 종가만)
+    print("바이낸스 모두 실패, CoinGecko로 폴백 시도")
+    try:
+        # CoinGecko는 200일치를 한 번에 주므로 직접 MA 계산 가능
+        cg_url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+        cg_params = {"vs_currency": "usd", "days": "200", "interval": "daily"}
+        r = requests.get(cg_url, params=cg_params, headers=headers, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        prices = data.get("prices", [])
+        # prices: [[timestamp, price], ...]
+        closes = [p[1] for p in prices]
+        # 바이낸스 klines 형식으로 변환: [open_time, open, high, low, close, ...]
+        klines = []
+        for i, (ts, close) in enumerate(prices):
+            k = [int(ts), 0, 0, 0, float(close), 0, 0, 0, 0, 0, 0, 0]
+            klines.append(k)
+        if len(klines) >= 120:
+            print(f"CoinGecko 폴백 성공: {len(klines)}개")
+            return klines
+    except Exception as e:
+        print(f"CoinGecko 폴백 실패: {e}")
+        last_err = e
+
+    raise last_err or Exception("모든 가격 소스 실패")
 
 def calc_ma(closes, period=120):
     if len(closes) < period:
@@ -72,15 +116,12 @@ def main():
     state = load_state()
     last_distance = state.get("last_distance")
 
-    # 1) 이탈 확정: 어제 종가 < 120MA
     if yesterday_close < ma120_yesterday:
         msg = f"💥 BTC 120MA 이탈 확정\n어제({yesterday_time}) 종가 ${yesterday_close:,.2f} < 120MA ${ma120_yesterday:,.2f} ({((yesterday_close-ma120_yesterday)/ma120_yesterday*100):+.2f}%)\n현재가 ${current_price:,.2f}"
         send_telegram(token, chat_id, msg)
-    # 2) 하회 중
     elif current_price < ma120_yesterday:
         msg = f"🚨 BTC 120MA 하회 중\n현재가 ${current_price:,.2f} < 120MA ${ma120_yesterday:,.2f} ({distance:+.2f}%)"
         send_telegram(token, chat_id, msg)
-    # 3) 근접 중 (5% 이내)
     elif distance <= 5.0:
         if last_distance is None or last_distance > 5.0:
             msg = f"⚠️ BTC 120MA 근접\n현재가 ${current_price:,.2f}, 120MA ${ma120_yesterday:,.2f} ({distance:+.2f}%) - 5% 이내 진입"
@@ -88,7 +129,6 @@ def main():
         else:
             print("이미 근접 알림 보낸 상태 - 중복 방지")
     else:
-        # 안정 구간
         if force_notify:
             msg = f"✅ BTC 일일 리포트 ({yesterday_time})\n어제 종가: ${yesterday_close:,.2f}\n120MA: ${ma120_yesterday:,.2f}\n현재가: ${current_price:,.2f}\n괴리: {distance:+.2f}%\n상태: 안정 구간 - 문제 없음"
             print("일일 리포트 발송 시도")
